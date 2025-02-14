@@ -1,0 +1,4 @@
+.vscode/
+*.json
+lab1/cmake/build/
+lab1/make/lab1
