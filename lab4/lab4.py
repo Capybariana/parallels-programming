@@ -1,162 +1,194 @@
-import cv2
-import threading
+import cv2 as cv
 import time
+import threading
+import queue
 import argparse
-from queue import LifoQueue,Queue
 import logging
-from typing import List
 import os
+import sys
+
+log_dir = "log"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+logging.basicConfig(filename=os.path.join(log_dir, "sensor_log.log"),
+                    level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 class Sensor:
     def get(self):
-        raise NotImplementedError("subclasses must implement method get()")
-
+        raise NotImplementedError("Subclasses must implement method get()")
 
 
 class SensorX(Sensor):
-    """Sensor X"""
+    """Simulated sensor with delay"""
     def __init__(self, delay: float):
-        self.delay = delay
-        self.data = 0
+        self._delay = delay
+        self._data = 0
 
     def get(self) -> int:
-        time.sleep(self.delay)
-        self.data += 1
-        return self.data
+        time.sleep(self._delay)
+        self._data += 1
+        return self._data
 
 
 class SensorCam(Sensor):
-    def __init__(self,camera_index:int = 0 ,width:int = 640,height:int = 480):
-        global bigerror
+    """Camera sensor"""
+    def __init__(self, camera_name, resolution):
+        self.camera_name = camera_name
+        self.width, self.height = map(int, resolution.split('x'))
         try:
-            self._cap = cv2.VideoCapture(camera_index)
-            if not self._cap.isOpened():
-                logging.error("we dont have a camera with this camera index")
-                bigerror = True
-                self.stop()
-                
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,width)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT,height)
+            self.cap = cv.VideoCapture(int(camera_name) if camera_name.isdigit() else camera_name, cv.CAP_DSHOW)
+            if not self.cap.isOpened():
+                raise ValueError("Camera not found")
+            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
         except Exception as e:
-            logging.error("We have an error : %s",str(e))
-            bigerror = True
-            self.stop()
+            logging.error(f"Fatal error: Camera initialization failed - {e}")
+            sys.exit(1)
 
-    
     def get(self):
-        ret,frame = self._cap.read()
+        """Retrieve a frame from the camera"""
+        ret, frame = self.cap.read()
         if not ret:
-            logging.error("we have no img from cam")
-            global bigerror
-            bigerror = True
-            self.stop()
+            logging.error("Camera disconnected or failed to read frame")
+            return None
         return frame
 
-    def stop(self):
-        self._cap.release()
-        
+    def release(self):
+        if hasattr(self, "cap"):
+            self.cap.release()
 
     def __del__(self):
-        self.stop()
+        self.release()
 
-def sensor_worker(sensor:SensorX,queue:LifoQueue):
-    global flag
-    lock = threading.Lock()
-    
-    while flag:
-        a = sensor.get()
-        
-        if queue.full():
-            queue.get()
-            queue.put(a)
-        else:
-            queue.put(a)
-        
-    print("Готово")
 
-    
+class WindowImage:
+    """Window display handler"""
+    def __init__(self, display_rate):
+        self.display_rate = display_rate
 
-def camera_worker(queue:Queue):
-    global flag
-    cam = SensorCam()
-    while flag:
-        a = cam.get()
-        if queue.full():
-            queue.get()
-            queue.put(a)
-        else:
-            queue.put(a)
-        
-    cam.stop
+    def show(self, img):
+        """Display the frame"""
+        cv.imshow("Sensor Data", img)
+        if cv.waitKey(int(1000 / self.display_rate)) & 0xFF == ord('q'):
+            return False
+        return True
 
-class ImageWindow():
-    def __init__(self,fps:int = 15,height:int = 480):
-        self._sensor_data = [0,0,0]
-        self.frame = None
-        self.fps = fps
-        self._lock = threading.Lock()
-        self._height = height
-    def show(self,cam_queue:Queue,queues:List[Queue]):
+    def release(self):
+        cv.destroyAllWindows()
+
+    def __del__(self):
+        self.release()
+
+
+def sensor_worker(sensor, data_queue):
+    """Thread for reading sensor data"""
+    while True:
         try:
-            
-            for i in range(3):
-                if queues[i].full():
-                    self._sensor_data[i] = queues[i].get()
-                    print(self._sensor_data[i])
-            if cam_queue.full():
-                self.frame=cam_queue.get()
-            
-            cv2.putText(self.frame,f"Sensor1: {self._sensor_data[0]}  Sensor2: {self._sensor_data[1]}  Sensor3: {self._sensor_data[2]}", (10,self._height-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 1)
-            cv2.imshow('camera and data',self.frame)
+            value = sensor.get()
+            if data_queue.full():
+                data_queue.get()
+            data_queue.put(value)
         except Exception as e:
-            logging.error("We have an error at show(): %s",str(e))
-
-    def stop(self):
-        cv2.destroyAllWindows()
-
-    def __del__(self):
-        self.stop()
+            logging.error(f"Sensor error: {e}")
+            time.sleep(1)
 
 
+def cleanup(camera, sensors, window):
+    """Release all resources"""
+    logging.info("Cleaning up resources...")
+    if camera:
+        camera.release()
+    for sensor in sensors:
+        del sensor
+    if window:
+        window.release()
+
+def camera_worker(camera, frame_queue, stop_event):
+    """Thread for capturing camera frames"""
+    while not stop_event.is_set():
+        try:
+            frame = camera.get()
+            if frame is None:
+                logging.error("Camera frame is None, possible disconnection")
+                stop_event.set()
+                return
+            if frame_queue.full():
+                frame_queue.get()
+            frame_queue.put(frame)
+        except Exception as e:
+            logging.error(f"Fatal camera worker error: {e}")
+            stop_event.set()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ширина, высота, FPS")
-    parser.add_argument("--camIndex",type=int,default=0)
-    parser.add_argument("--height", type=int, default =480 )
-    parser.add_argument("--width", type=int, default = 720)
-    parser.add_argument("--fps", type=int, default=15)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--camera", type=str, default="0", help="Camera name or ID")
+    parser.add_argument("--resolution", type=str, default="640x480", help="Camera resolution")
+    parser.add_argument("--fps", type=int, default=30, help="Display refresh rate (FPS)")
     args = parser.parse_args()
-    if not os.path.exists('log'):
-        os.makedirs('log')
-    
-    log_file = os.path.join('log','error.log')
-    logging.basicConfig(filename=log_file, level=logging.ERROR,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-    flag = True
-    bigerror = False
-    # создаём сенсоры, камеру и окнонный обозреватель
-    sensors = [SensorX(i) for i in [0.01,0.1,1]]
-    sensor_queues = [LifoQueue(maxsize=1) for _ in range(3)]
-    cam_queue = Queue(maxsize=1)
-    sensor_workers = [threading.Thread(target=sensor_worker,args=(sensors[i],sensor_queues[i])) for i in range(3)]
-    cam_worker = threading.Thread(target=camera_worker,args=(cam_queue,))
-    time.sleep(1)
-    window_imager = ImageWindow(fps = args.fps,height=args.height)
-    for i in range(3):
-        sensor_workers[i].start()
-    cam_worker.start()
-    while True:
-        
-        print("tryhard")
-        window_imager.show(cam_queue,sensor_queues)
-        if cv2.waitKey(1) & 0xFF == ord('q') or bigerror:
-            window_imager.stop()
+    camera = None
+    sensors = []
+    window = None
+    stop_event = threading.Event()
+
+    try:
+        camera = SensorCam(args.camera, args.resolution)
+        sensors = [SensorX(0.01), SensorX(0.1), SensorX(1)]
+        frame_queue = queue.Queue(maxsize=2)
+        sensor_queues = [queue.Queue(maxsize=2) for _ in sensors]
+
+        # Sensor threads
+        for sensor, sensor_queue in zip(sensors, sensor_queues):
+            threading.Thread(target=sensor_worker, args=(sensor, sensor_queue), daemon=True).start()
+
+        # Camera thread
+        cam_thread = threading.Thread(target=camera_worker, args=(camera, frame_queue, stop_event), daemon=True)
+        cam_thread.start()
+
+        window = WindowImage(args.fps)
+
+        # FPS sync
+        prev_time = time.time()
+
+        while not stop_event.is_set():
+            current_time = time.time()
+            elapsed_time = current_time - prev_time
+
             
-            flag=False
-            cam_worker.join()
-            for sensor_workerr in sensor_workers:
-                sensor_workerr.join()
-            break
-        
-        time.sleep(1/window_imager.fps)
+            if elapsed_time >= (1 / args.fps):
+                prev_time = current_time
+
+                try:
+                    frame = frame_queue.get_nowait()
+                except queue.Empty:
+                    frame = None
+
+                if frame is not None:
+                    for i, sensor_queue in enumerate(sensor_queues):
+                        try:
+                            sensor_value = sensor_queue.get_nowait()
+                        except queue.Empty:
+                            sensor_value = "N/A"
+                        cv.putText(frame, f"Sensor {i}: {sensor_value}", (10, 30 + i * 30),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 1)
+
+                    if not window.show(frame):
+                        logging.info("KeyboardInterrupt: Exiting program")
+                        stop_event.set()
+                        break
+            else:
+                time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt: Exiting program")
+    except SystemExit:
+        logging.error("System exit triggered due to fatal error")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+    finally:
+        cleanup(camera, sensors, window)
+        logging.info("Program exited successfully.")
+        sys.exit(0)
